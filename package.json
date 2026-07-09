@@ -1,0 +1,12 @@
+{
+  "name": "tank-wars-license-server",
+  "version": "1.0.0",
+  "description": "Activation + heartbeat server for Tank Wars license codes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
