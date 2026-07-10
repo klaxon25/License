@@ -32,7 +32,7 @@ function saveDb(db) {
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
 function generateCode() {
   const group = () => Array.from({ length: 4 }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
-  return `TANK-${group()}-${group()}-${group()}`;
+  return `-${group()}-${group()}-${group()}`;
 }
 
 function signToken(payload) {
