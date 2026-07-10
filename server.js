@@ -1,37 +1,3 @@
-// =========================================================================
-// TANK WARS — LICENSE SERVER
-// -------------------------------------------------------------------------
-// Small, self-contained activation server. One code = one machine, 30-day
-// validity from first activation, revocable by you at any time. Storage is
-// a single JSON file (codes.json) next to this script — plenty for an
-// indie-scale number of activations; swap for a real DB later if needed.
-//
-// ENDPOINTS
-//   POST /admin/generate   { count }         header: x-admin-key   -> { codes: [...] }
-//   POST /admin/revoke     { code }          header: x-admin-key   -> { ok: true }
-//   GET  /admin/status                       header: x-admin-key   -> summary of all codes
-//   POST /activate         { code, hardwareId }                    -> { token, expiresAt }
-//   POST /heartbeat        { token }                                -> { token, expiresAt }
-//
-// RUN LOCALLY
-//   cd license-server
-//   npm install
-//   set ADMIN_KEY=some-long-random-string   (Windows: use `set`, macOS/Linux: `export`)
-//   npm start
-//
-// DEPLOY (pick one — any Node host works, this needs no database):
-//   - Render.com: New "Web Service" -> point at this folder -> build
-//     command `npm install` -> start command `npm start` -> add an
-//     environment variable ADMIN_KEY with your own secret. Free tier is
-//     fine to start.
-//   - Railway.app / Fly.io: same idea, just set ADMIN_KEY as an env var.
-//   - Your own VPS: `pm2 start server.js` behind nginx, or run in a
-//     screen/tmux session. Make sure port matches your reverse proxy.
-//
-// After deploying, put the public HTTPS URL into
-// src/license-config.js -> LICENSE_SERVER_URL in the Electron app.
-// =========================================================================
-
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -39,22 +5,19 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 4100;
 const ADMIN_KEY = process.env.ADMIN_KEY;
-// Signs activation tokens. MUST be set to your own long random value in
-// production — if you don't set TOKEN_SECRET, one is generated at boot,
-// which means every restart invalidates all existing tokens (fine for
-// local testing, NOT fine for a real deploy).
 const TOKEN_SECRET = process.env.TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
 const DB_PATH = path.join(__dirname, 'codes.json');
-const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_DURATION_DAYS = 30;
+const MAX_DURATION_DAYS = 3650; // 10 years — generous ceiling, just guards against a typo'd huge number
 
 if (!ADMIN_KEY) {
   console.warn('[WARN] ADMIN_KEY is not set — /admin/* routes will refuse all requests until you set it.');
 }
 if (!process.env.TOKEN_SECRET) {
-  console.warn('[WARN] TOKEN_SECRET is not set — using a random one for this process only. Set it as an env var so restarts do not invalidate everyone\'s activation.');
+  console.warn('[WARN] TOKEN_SECRET is not set — using a random one for this process only. Restarts will invalidate every existing token.');
 }
 
-// --- tiny JSON "database" -------------------------------------------------
 function loadDb() {
   try {
     return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'));
@@ -66,14 +29,12 @@ function saveDb(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
 }
 
-// --- code format: TANK-XXXX-XXXX-XXXX, no ambiguous chars ---------------
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
 function generateCode() {
   const group = () => Array.from({ length: 4 }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
   return `TANK-${group()}-${group()}-${group()}`;
 }
 
-// --- token signing (mini HMAC-signed token, not JWT, no extra deps) -----
 function signToken(payload) {
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(payloadB64).digest('hex');
@@ -103,25 +64,38 @@ function requireAdmin(req, res, next) {
 const app = express();
 app.use(express.json());
 
-// ---------------------------------------------------------------- admin --
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-admin-key');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.post('/admin/generate', requireAdmin, (req, res) => {
   const count = Math.min(Math.max(parseInt(req.body?.count, 10) || 1, 1), 200);
+  // Per-batch validity window in days (e.g. 7 for a trial code, 365 for a
+  // yearly code). Stored per-code so a later batch with a different
+  // duration doesn't affect codes already generated. Falls back to 30 if
+  // omitted or invalid.
+  const durationDays = Math.min(Math.max(parseInt(req.body?.days, 10) || DEFAULT_DURATION_DAYS, 1), MAX_DURATION_DAYS);
   const db = loadDb();
   const codes = [];
   for (let i = 0; i < count; i++) {
     let code;
-    do { code = generateCode(); } while (db[code]); // avoid collisions
+    do { code = generateCode(); } while (db[code]);
     db[code] = {
       hardwareId: null,
       activatedAt: null,
       expiresAt: null,
+      durationDays,
       revoked: false,
       createdAt: Date.now()
     };
     codes.push(code);
   }
   saveDb(db);
-  res.json({ codes });
+  res.json({ codes, durationDays });
 });
 
 app.post('/admin/revoke', requireAdmin, (req, res) => {
@@ -140,12 +114,12 @@ app.get('/admin/status', requireAdmin, (req, res) => {
     status: entry.revoked ? 'revoked' : !entry.hardwareId ? 'unused' : (entry.expiresAt <= Date.now() ? 'expired' : 'active'),
     activatedAt: entry.activatedAt,
     expiresAt: entry.expiresAt,
+    durationDays: entry.durationDays || DEFAULT_DURATION_DAYS,
     hardwareId: entry.hardwareId ? entry.hardwareId.slice(0, 8) + '…' : null
   }));
   res.json({ total: summary.length, codes: summary });
 });
 
-// ------------------------------------------------------------- activate --
 app.post('/activate', (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   const hardwareId = String(req.body?.hardwareId || '').trim();
@@ -159,17 +133,16 @@ app.post('/activate', (req, res) => {
   const now = Date.now();
 
   if (!entry.hardwareId) {
-    // First activation — bind to this machine and start the 30-day clock.
     entry.hardwareId = hardwareId;
     entry.activatedAt = now;
-    entry.expiresAt = now + THIRTY_DAYS_MS;
+    // durationDays is set at generation time (see /admin/generate). Codes
+    // created before this field existed fall back to the original 30-day
+    // behavior.
+    entry.expiresAt = now + (entry.durationDays || DEFAULT_DURATION_DAYS) * ONE_DAY_MS;
     saveDb(db);
   } else if (entry.hardwareId !== hardwareId) {
-    // Already bound to a different machine — one code, one PC.
     return res.status(409).json({ error: 'device_mismatch' });
   }
-  // else: same machine re-activating (reinstall) — fall through, don't
-  // touch activatedAt/expiresAt.
 
   if (entry.expiresAt <= now) return res.status(410).json({ error: 'expired' });
 
@@ -177,7 +150,6 @@ app.post('/activate', (req, res) => {
   res.json({ token, expiresAt: entry.expiresAt });
 });
 
-// ------------------------------------------------------------- heartbeat --
 app.post('/heartbeat', (req, res) => {
   const payload = verifyToken(req.body?.token);
   if (!payload) return res.status(401).json({ error: 'invalid_token' });
